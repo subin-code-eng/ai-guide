@@ -1,21 +1,36 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Sparkles, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { places } from '@/data/places';
 import ReactMarkdown from 'react-markdown';
+import { toast } from 'sonner';
+
+const CACHE_KEY = 'ai-recommender-cache';
+const CACHE_TTL = 15 * 60 * 1000; // 15 min
 
 const AIRecommender = () => {
   const [text, setText] = useState('');
   const [loading, setLoading] = useState(false);
+  const inflight = useRef(false);
 
-  const fetchRec = async () => {
+  const fetchRec = async (force = false) => {
+    if (inflight.current) return;
+    if (!force) {
+      try {
+        const raw = sessionStorage.getItem(CACHE_KEY);
+        if (raw) {
+          const { t, v } = JSON.parse(raw);
+          if (Date.now() - t < CACHE_TTL && v) { setText(v); return; }
+        }
+      } catch {}
+    }
+    inflight.current = true;
     setLoading(true);
     try {
       const high = places.filter(p => p.crowdLevel === 'high');
       const altIds = new Set(high.flatMap(p => p.nearbyAlternatives ?? []));
       const alts = places.filter(p => altIds.has(p.id) || p.crowdLevel === 'low');
-      const url = '/api/ai-assistant';
-      const resp = await fetch(url, {
+      const resp = await fetch('/api/ai-assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -25,10 +40,17 @@ const AIRecommender = () => {
           alternatives: alts.map(p => `- ${p.name} (${p.category}): ${p.description}`).join('\n'),
         }),
       });
+      if (resp.status === 429) {
+        toast.error('AI quota reached for today. Try again later.');
+        setText('Daily AI quota reached. Recommendations will resume tomorrow.');
+        return;
+      }
       const data = await resp.json();
-      setText(data.result ?? '');
+      const result = data.result ?? '';
+      setText(result);
+      try { sessionStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), v: result })); } catch {}
     } catch { setText('Unable to fetch recommendation right now.'); }
-    finally { setLoading(false); }
+    finally { setLoading(false); inflight.current = false; }
   };
 
   useEffect(() => { fetchRec(); /* eslint-disable-next-line */ }, []);
