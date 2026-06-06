@@ -62,7 +62,7 @@ const AIRecommender = () => {
           <Sparkles className="w-4 h-4 text-secondary" />
           <h3 className="font-serif font-semibold text-foreground">AI Pick for Right Now</h3>
         </div>
-        <Button variant="ghost" size="icon" onClick={fetchRec} disabled={loading} aria-label="refresh">
+        <Button variant="ghost" size="icon" onClick={() => fetchRec(true)} disabled={loading} aria-label="refresh">
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
         </Button>
       </div>
