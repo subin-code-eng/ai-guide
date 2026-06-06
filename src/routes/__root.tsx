@@ -113,13 +113,48 @@ function RootShell({ children }: { children: ReactNode }) {
   );
 }
 
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Toaster as Sonner } from "@/components/ui/sonner";
+import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { useLocation, useNavigate } from "@tanstack/react-router";
+
+function AuthGate({ children }: { children: ReactNode }) {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const isAuthRoute = location.pathname.startsWith("/auth");
+
+  useEffect(() => {
+    if (!loading && !user && !isAuthRoute) {
+      navigate({ to: "/auth", replace: true });
+    }
+  }, [loading, user, isAuthRoute, navigate]);
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+      </div>
+    );
+  }
+
+  if (!user && !isAuthRoute) return null;
+  return <>{children}</>;
+}
+
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
 
   return (
     <QueryClientProvider client={queryClient}>
-      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
-      <Outlet />
+      <AuthProvider>
+        <TooltipProvider>
+          <Sonner />
+          <AuthGate>
+            <Outlet />
+          </AuthGate>
+        </TooltipProvider>
+      </AuthProvider>
     </QueryClientProvider>
   );
 }
