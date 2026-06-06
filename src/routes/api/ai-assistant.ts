@@ -1,9 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-// OpenRouter — OpenAI-compatible gateway. Works on Lovable AND Vercel.
-// Get a key at https://openrouter.ai/keys and set OPENROUTER_API_KEY.
-const GATEWAY_URL = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL = "google/gemini-2.5-flash";
+// Direct Google Gemini API integration.
+// Set GEMINI_API_KEY as a server secret. Get a key at https://aistudio.google.com/apikey
+const MODEL = "gemini-2.5-flash";
+const BASE = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}`;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -18,36 +18,114 @@ function json(body: unknown, status = 200) {
   });
 }
 
-async function callGateway(messages: any[], stream = false) {
-  const apiKey = process.env.OPENROUTER_API_KEY || process.env.LOVABLE_API_KEY;
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY not configured");
-  return await fetch(GATEWAY_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://mysuru-heritage.lovable.app",
-      "X-Title": "Mysuru Heritage Guide",
-    },
-    body: JSON.stringify({ model: MODEL, stream, messages }),
-  });
+type ChatMsg = { role: "user" | "assistant" | "system"; content: string };
+
+function toGeminiContents(messages: ChatMsg[]) {
+  return messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    }));
 }
 
-async function nonStreamText(messages: any[]): Promise<string> {
-  const r = await callGateway(messages, false);
+function getKey() {
+  const k = process.env.GEMINI_API_KEY;
+  if (!k) throw new Error("GEMINI_API_KEY not configured");
+  return k;
+}
+
+async function geminiGenerate(systemText: string, messages: ChatMsg[]) {
+  const body = {
+    system_instruction: { parts: [{ text: systemText }] },
+    contents: toGeminiContents(messages),
+  };
+  const r = await fetch(`${BASE}:generateContent?key=${getKey()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   if (!r.ok) {
     const t = await r.text();
     throw new Response(t, { status: r.status });
   }
   const d = await r.json();
-  return d.choices?.[0]?.message?.content ?? "";
+  const text =
+    d.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") ?? "";
+  return text;
+}
+
+async function geminiStream(systemText: string, messages: ChatMsg[]) {
+  const body = {
+    system_instruction: { parts: [{ text: systemText }] },
+    contents: toGeminiContents(messages),
+  };
+  return await fetch(`${BASE}:streamGenerateContent?alt=sse&key=${getKey()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// Translate Gemini SSE stream to OpenAI-style delta SSE that the client expects.
+function geminiToOpenAIStream(geminiBody: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const reader = geminiBody.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+
+  return new ReadableStream({
+    async pull(controller) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          let line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (!payload) continue;
+          try {
+            const parsed = JSON.parse(payload);
+            const text =
+              parsed.candidates?.[0]?.content?.parts
+                ?.map((p: any) => p.text)
+                .join("") ?? "";
+            if (text) {
+              const out = { choices: [{ delta: { content: text } }] };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(out)}\n\n`));
+            }
+          } catch {
+            // partial JSON line, put back
+            buffer = line + "\n" + buffer;
+            return;
+          }
+        }
+        return; // yield back to consumer
+      }
+    },
+    cancel() {
+      reader.cancel().catch(() => {});
+    },
+  });
 }
 
 function extractJson(text: string): any {
   const cleaned = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
   const m = cleaned.match(/[\{\[][\s\S]*[\}\]]/);
   if (!m) return null;
-  try { return JSON.parse(m[0]); } catch { return null; }
+  try {
+    return JSON.parse(m[0]);
+  } catch {
+    return null;
+  }
 }
 
 export const Route = createFileRoute("/api/ai-assistant")({
@@ -60,14 +138,14 @@ export const Route = createFileRoute("/api/ai-assistant")({
           const mode = payload.mode;
 
           if (mode === "chat") {
-            const system = `You are the Mysuru Heritage Guide — warm, concise, knowledgeable about Mysuru's hidden gems, master artisans, and quiet alternatives to crowded places. Ground answers in CONTEXT. If asked about something outside context, say so and suggest a related option.\n\nCONTEXT:\n${payload.context ?? ""}`;
-            const messages = [{ role: "system", content: system }, ...payload.messages];
-            const r = await callGateway(messages, true);
-            if (!r.ok) {
+            const system = `You are the Mysuru Heritage Guide — a warm, deeply knowledgeable local expert. Be open and generous: reveal ALL the hidden gems, secret spots, lesser-known artisans, off-the-tourist-trail experiences, quiet alternatives, best timings, local rituals, and insider tips. Never hold back information. Ground answers in CONTEXT but enrich them with rich Mysuru cultural knowledge. Use markdown.\n\nCONTEXT:\n${payload.context ?? ""}`;
+            const r = await geminiStream(system, payload.messages);
+            if (!r.ok || !r.body) {
               const t = await r.text();
               return new Response(t, { status: r.status, headers: corsHeaders });
             }
-            return new Response(r.body, {
+            const stream = geminiToOpenAIStream(r.body);
+            return new Response(stream, {
               status: 200,
               headers: { ...corsHeaders, "Content-Type": "text/event-stream" },
             });
@@ -75,40 +153,46 @@ export const Route = createFileRoute("/api/ai-assistant")({
 
           if (mode === "recommend") {
             const prompt = `Hour ${payload.hour} in Mysuru. CROWDED now: ${(payload.highCrowdNames || []).join(", ") || "none"}.\n\nQuieter alternatives:\n${payload.alternatives}\n\nRecommend ONE place to visit right now. 2-3 sentences. Markdown with **bold** place name.`;
-            const text = await nonStreamText([
-              { role: "system", content: "Savvy local Mysuru guide helping visitors avoid crowds." },
-              { role: "user", content: prompt },
-            ]);
+            const text = await geminiGenerate(
+              "Savvy local Mysuru guide helping visitors avoid crowds.",
+              [{ role: "user", content: prompt }],
+            );
             return json({ result: text });
           }
 
           if (mode === "search") {
             const prompt = `Query: "${payload.query}"\n\nPLACES (id|name|category|description):\n${payload.places}\n\nARTISANS (id|name|craft|specialty|location):\n${payload.artisans}\n\nReturn ONLY JSON: {"place_ids":[...],"artisan_ids":[...],"explanation":"one sentence"}`;
-            const text = await nonStreamText([
-              { role: "system", content: "Match queries to Mysuru places/artisans. Return strict JSON only." },
-              { role: "user", content: prompt },
-            ]);
-            const parsed = extractJson(text) ?? { place_ids: [], artisan_ids: [], explanation: text };
+            const text = await geminiGenerate(
+              "Match queries to Mysuru places/artisans. Return strict JSON only.",
+              [{ role: "user", content: prompt }],
+            );
+            const parsed = extractJson(text) ?? {
+              place_ids: [],
+              artisan_ids: [],
+              explanation: text,
+            };
             return json(parsed);
           }
 
           if (mode === "generate_trail") {
-            const prompt = `Build a personalized Mysuru trail.\nInterests: ${payload.interests}\nHours: ${payload.hours}\n\nPLACES:\n${payload.places}\n\nARTISANS:\n${payload.artisans}\n\nReturn ONLY JSON:\n{"name":"...","tagline":"...","narrative":"markdown 3-5 short paras","place_ids":[...],"artisan_ids":[...],"estimated_duration":"e.g. 3 hours"}`;
-            const text = await nonStreamText([
-              { role: "system", content: "Master storyteller crafting Mysuru heritage trails. Strict JSON only." },
-              { role: "user", content: prompt },
-            ]);
+            const prompt = `Build a personalized Mysuru trail. Include hidden gems freely.\nInterests: ${payload.interests}\nHours: ${payload.hours}\n\nPLACES:\n${payload.places}\n\nARTISANS:\n${payload.artisans}\n\nReturn ONLY JSON:\n{"name":"...","tagline":"...","narrative":"markdown 3-5 short paras","place_ids":[...],"artisan_ids":[...],"estimated_duration":"e.g. 3 hours"}`;
+            const text = await geminiGenerate(
+              "Master storyteller crafting Mysuru heritage trails. Strict JSON only.",
+              [{ role: "user", content: prompt }],
+            );
             const parsed = extractJson(text);
             if (!parsed) return json({ error: "parse_failed", raw: text }, 500);
             return json(parsed);
           }
 
           if (mode === "storyteller") {
-            const prompt = `Re-narrate this trail as an evocative short story (markdown, 3 paragraphs).\n\nItems:\n${(payload.items || []).map((i: any) => `- ${i.name} (${i.type}): ${i.description}`).join("\n")}`;
-            const text = await nonStreamText([
-              { role: "system", content: "Poetic Mysuru storyteller. Sensory, historically grounded prose." },
-              { role: "user", content: prompt },
-            ]);
+            const prompt = `Re-narrate this trail as an evocative short story (markdown, 3 paragraphs).\n\nItems:\n${(payload.items || [])
+              .map((i: any) => `- ${i.name} (${i.type}): ${i.description}`)
+              .join("\n")}`;
+            const text = await geminiGenerate(
+              "Poetic Mysuru storyteller. Sensory, historically grounded prose.",
+              [{ role: "user", content: prompt }],
+            );
             return json({ result: text });
           }
 
