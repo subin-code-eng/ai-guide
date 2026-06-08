@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 
 // Direct Google Gemini API integration.
 // Set GEMINI_API_KEY as a server secret. Get a key at https://aistudio.google.com/apikey
-const MODEL = "gemini-2.5-flash-lite";
+const MODEL = "gemini-2.5-flash";
 const BASE = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}`;
 
 const corsHeaders = {
